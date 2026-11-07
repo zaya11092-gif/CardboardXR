@@ -13,13 +13,15 @@ name: Build iOS (.ipa)
 # Required secrets (a free Unity Personal license works):
 #   UNITY_EMAIL     your Unity account email
 #   UNITY_PASSWORD  your Unity account password
-# Unity 6 has no headless activation for Personal licenses: a .ulf file is
-# machine-bound (one generated on your own machine is rejected on the runner
-# with "Machine bindings don't match"), and the Hub CLI no longer handles
-# Personal at all. The workflow therefore automates Unity's manual activation
-# with unity-activate: the license request file is generated on the runner,
-# submitted through Unity's license site with your account, and the
-# runner-bound .ulf it returns is imported — so the bindings always match.
+# Unity 6 has no supported headless activation for Personal licenses: a .ulf
+# file is machine-bound (one generated on your own machine is rejected on the
+# runner), the Hub CLI no longer handles Personal, and the editor's
+# -username/-password flags no longer grant it. The workflow activates through
+# @rage-against-the-pixel/unity-cli, which drives the Unity Licensing Client
+# with the Unity ID email and password
+# (github.com/RageAgainstThePixel/unity-cli). The license is NOT returned
+# afterwards: GitHub-hosted macOS runners report one machine identity to
+# Unity, so returning it would revoke it for every other job too.
 # Optional secrets (produce a signed .ipa instead of an unsigned one):
 #   APPLE_CERTIFICATE           base64 of a .p12 developer certificate
 #   APPLE_CERTIFICATE_PASSWORD  the .p12's password
@@ -100,29 +102,25 @@ jobs:
           fi
           "$UNITY" -version
 
-      # Unity 6 Personal licenses can only be activated by an account login on
-      # this machine. unity-activate drives Unity's own manual-activation flow:
-      # the .alf request is generated here (so the machine bindings match), it
-      # submits it through Unity's license site with the account, and the .ulf
-      # it returns is imported with -manualLicenseFile.
+      # Unity 6 Personal licenses can only be activated through an account
+      # login on this machine. unity-cli (needs Node 24+) does that headlessly
+      # through the Unity Licensing Client; do NOT return the license after —
+      # see the header comment.
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Activate Unity Personal license
         env:
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          # unity-cli reads UNITY_USERNAME / UNITY_PASSWORD.
+          UNITY_USERNAME: ${{ secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
           set -euo pipefail
-          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
-          cd "$RUNNER_TEMP"
-          "$UNITY" -batchmode -nographics -logFile - -createManualActivationFile || \
-            echo "::warning::-createManualActivationFile returned nonzero; checking for the request file anyway"
-          ALF=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'Unity_*.alf' -print -quit)
-          [ -n "$ALF" ] || { echo "::error::No license request (.alf) was generated"; exit 1; }
-          echo "License request: $ALF"
-          npx --yes unity-activate -u "$UNITY_EMAIL" -p "$UNITY_PASSWORD" -o "$RUNNER_TEMP" "$ALF"
-          ULF=$(find "$RUNNER_TEMP" -maxdepth 1 -name '*.ulf' -print -quit)
-          [ -n "$ULF" ] || { echo "::error::unity-activate returned no .ulf license"; exit 1; }
-          "$UNITY" -batchmode -nographics -quit -logFile - -manualLicenseFile "$ULF"
-          echo "== license ready: $ULF"
+          npm install -g @rage-against-the-pixel/unity-cli
+          unity-cli activate-license --license personal
+          unity-cli license-context || true
 
       # Read by ProjectBootstrap.StereoBuilder; empty values are ignored by it.
       - name: Export Xcode project with Unity
@@ -139,15 +137,6 @@ jobs:
             -logFile - | tee unity-export.log
           grep -q "Build Succeeded" unity-export.log || {
             echo "::error::Unity export did not report Build Succeeded"; exit 1; }
-
-      # Release the seat right after the export; the next run activates again.
-      - name: Return Unity license
-        if: always()
-        run: |
-          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
-          if [ -x "$UNITY" ]; then
-            "$UNITY" -batchmode -nographics -quit -logFile - -returnlicense || true
-          fi
 
       # Signed path: archive and export with the certificate and profile from
       # the secrets. The profile decides the signing identity and export method:
