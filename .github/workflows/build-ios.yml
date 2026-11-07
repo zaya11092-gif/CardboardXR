@@ -11,10 +11,14 @@ name: Build iOS (.ipa)
 # instead (a paid Apple Developer account is needed for a distribution profile).
 #
 # Required secrets (a free Unity Personal license works):
-#   UNITY_LICENSE   full content of your Unity_lic.ulf file
-#                   (how to get it: https://game.ci/docs/github/activation)
 #   UNITY_EMAIL     your Unity account email
 #   UNITY_PASSWORD  your Unity account password
+# The Personal license is activated on the runner at build time by logging in
+# with these. Unity 6 offers no other CI path for Personal: a .ulf file carries
+# machine bindings, so one generated on your own machine is rejected on the
+# runner ("Machine bindings don't match"), and the editor's command-line
+# -username/-password flags no longer grant Personal either — only the Hub's
+# headless login does.
 # Optional secrets (produce a signed .ipa instead of an unsigned one):
 #   APPLE_CERTIFICATE           base64 of a .p12 developer certificate
 #   APPLE_CERTIFICATE_PASSWORD  the .p12's password
@@ -54,13 +58,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Check Unity license secrets
+      - name: Check Unity account secrets
         env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
-          if [ -z "$UNITY_LICENSE" ] && [ -z "$UNITY_EMAIL" ]; then
-            echo "::error::No Unity license configured, and Unity refuses to build without one (a free Personal license works). Add the repository secrets UNITY_LICENSE (full content of your Unity_lic.ulf file), UNITY_EMAIL and UNITY_PASSWORD, then re-run this workflow. See https://game.ci/docs/github/activation for how to get the .ulf file."
+          if [ -z "$UNITY_EMAIL" ] || [ -z "$UNITY_PASSWORD" ]; then
+            echo "::error::Unity account secrets missing. The free Personal license is activated on the runner by logging in with a Unity account — a .ulf file cannot be used in CI (it is machine-bound, Unity 6 rejects it with 'Machine bindings don't match'). Add the repository secrets UNITY_EMAIL and UNITY_PASSWORD, then re-run this workflow. Note: two-factor authentication on the Unity account will fail this headless login unless disabled."
             exit 1
           fi
 
@@ -95,24 +99,18 @@ jobs:
           fi
           "$UNITY" -version
 
-      # Unity's manual activation: import the .ulf through the editor, and keep
-      # a copy at the classic license path as a fallback (Unity 6000.x reads it
-      # from /Library/Application Support/Unity on macOS).
-      - name: Activate Unity license
+      # Unity 6 Personal licenses can only be activated by an account login:
+      # the editor's -username/-password flags no longer grant Personal, and a
+      # .ulf file is machine-bound. The Hub CLI logs in headlessly instead.
+      - name: Activate Unity Personal license
         env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
           set -euo pipefail
-          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
-          LICENSE_DIR="/Library/Application Support/Unity"
-          ULF="$RUNNER_TEMP/Unity_lic.ulf"
-          printf '%s' "$UNITY_LICENSE" > "$ULF"
-          sudo mkdir -p "$LICENSE_DIR"
-          sudo chmod -R 777 "$LICENSE_DIR"
-          "$UNITY" -batchmode -nographics -quit -logFile - -manualLicenseFile "$ULF" || \
-            echo "::warning::-manualLicenseFile returned nonzero; relying on the license file placed below"
-          sudo cp "$ULF" "$LICENSE_DIR/Unity_lic.ulf"
-          ls -la "$LICENSE_DIR"
+          HUB="/Applications/Unity Hub.app/Contents/MacOS/Unity Hub"
+          "$HUB" -- --headless login --username "$UNITY_EMAIL" --password "$UNITY_PASSWORD"
+          "$HUB" -- --headless license activate -p || "$HUB" -- --headless license activate --personal
 
       # Read by ProjectBootstrap.StereoBuilder; empty values are ignored by it.
       - name: Export Xcode project with Unity
