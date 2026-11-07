@@ -124,15 +124,6 @@ jobs:
           "$UNITY" -batchmode -nographics -quit -logFile - -manualLicenseFile "$ULF"
           echo "== license ready: $ULF"
 
-      # Release the seat right after the export; the next run activates again.
-      - name: Return Unity license
-        if: always()
-        run: |
-          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
-          if [ -x "$UNITY" ]; then
-            "$UNITY" -batchmode -nographics -quit -logFile - -returnlicense || true
-          fi
-
       # Read by ProjectBootstrap.StereoBuilder; empty values are ignored by it.
       - name: Export Xcode project with Unity
         env:
@@ -148,6 +139,15 @@ jobs:
             -logFile - | tee unity-export.log
           grep -q "Build Succeeded" unity-export.log || {
             echo "::error::Unity export did not report Build Succeeded"; exit 1; }
+
+      # Release the seat right after the export; the next run activates again.
+      - name: Return Unity license
+        if: always()
+        run: |
+          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          if [ -x "$UNITY" ]; then
+            "$UNITY" -batchmode -nographics -quit -logFile - -returnlicense || true
+          fi
 
       # Signed path: archive and export with the certificate and profile from
       # the secrets. The profile decides the signing identity and export method:
