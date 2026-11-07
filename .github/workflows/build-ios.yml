@@ -13,12 +13,13 @@ name: Build iOS (.ipa)
 # Required secrets (a free Unity Personal license works):
 #   UNITY_EMAIL     your Unity account email
 #   UNITY_PASSWORD  your Unity account password
-# The Personal license is activated on the runner at build time by logging in
-# with these. Unity 6 offers no other CI path for Personal: a .ulf file carries
-# machine bindings, so one generated on your own machine is rejected on the
-# runner ("Machine bindings don't match"), and the editor's command-line
-# -username/-password flags no longer grant Personal either — only the Hub's
-# headless login does.
+# Unity 6 has no headless activation for Personal licenses: a .ulf file is
+# machine-bound (one generated on your own machine is rejected on the runner
+# with "Machine bindings don't match"), and the Hub CLI no longer handles
+# Personal at all. The workflow therefore automates Unity's manual activation
+# with unity-activate: the license request file is generated on the runner,
+# submitted through Unity's license site with your account, and the
+# runner-bound .ulf it returns is imported — so the bindings always match.
 # Optional secrets (produce a signed .ipa instead of an unsigned one):
 #   APPLE_CERTIFICATE           base64 of a .p12 developer certificate
 #   APPLE_CERTIFICATE_PASSWORD  the .p12's password
@@ -64,7 +65,7 @@ jobs:
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
           if [ -z "$UNITY_EMAIL" ] || [ -z "$UNITY_PASSWORD" ]; then
-            echo "::error::Unity account secrets missing. The free Personal license is activated on the runner by logging in with a Unity account — a .ulf file cannot be used in CI (it is machine-bound, Unity 6 rejects it with 'Machine bindings don't match'). Add the repository secrets UNITY_EMAIL and UNITY_PASSWORD, then re-run this workflow. Note: two-factor authentication on the Unity account will fail this headless login unless disabled."
+            echo "::error::Unity account secrets missing. Unity 6 Personal licenses can only be activated by logging in on the machine running the build — a .ulf generated elsewhere is machine-bound and rejected. Add the repository secrets UNITY_EMAIL and UNITY_PASSWORD, then re-run this workflow. Note: two-factor authentication on the Unity account is not supported here."
             exit 1
           fi
 
@@ -99,18 +100,38 @@ jobs:
           fi
           "$UNITY" -version
 
-      # Unity 6 Personal licenses can only be activated by an account login:
-      # the editor's -username/-password flags no longer grant Personal, and a
-      # .ulf file is machine-bound. The Hub CLI logs in headlessly instead.
+      # Unity 6 Personal licenses can only be activated by an account login on
+      # this machine. unity-activate drives Unity's own manual-activation flow:
+      # the .alf request is generated here (so the machine bindings match), it
+      # submits it through Unity's license site with the account, and the .ulf
+      # it returns is imported with -manualLicenseFile.
       - name: Activate Unity Personal license
         env:
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
           set -euo pipefail
-          HUB="/Applications/Unity Hub.app/Contents/MacOS/Unity Hub"
-          "$HUB" -- --headless login --username "$UNITY_EMAIL" --password "$UNITY_PASSWORD"
-          "$HUB" -- --headless license activate -p || "$HUB" -- --headless license activate --personal
+          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          cd "$RUNNER_TEMP"
+          "$UNITY" -batchmode -nographics -logFile - -createManualActivationFile || \
+            echo "::warning::-createManualActivationFile returned nonzero; checking for the request file anyway"
+          ALF=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'Unity_*.alf' -print -quit)
+          [ -n "$ALF" ] || { echo "::error::No license request (.alf) was generated"; exit 1; }
+          echo "License request: $ALF"
+          npx --yes unity-activate -u "$UNITY_EMAIL" -p "$UNITY_PASSWORD" -o "$RUNNER_TEMP" "$ALF"
+          ULF=$(find "$RUNNER_TEMP" -maxdepth 1 -name '*.ulf' -print -quit)
+          [ -n "$ULF" ] || { echo "::error::unity-activate returned no .ulf license"; exit 1; }
+          "$UNITY" -batchmode -nographics -quit -logFile - -manualLicenseFile "$ULF"
+          echo "== license ready: $ULF"
+
+      # Release the seat right after the export; the next run activates again.
+      - name: Return Unity license
+        if: always()
+        run: |
+          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          if [ -x "$UNITY" ]; then
+            "$UNITY" -batchmode -nographics -quit -logFile - -returnlicense || true
+          fi
 
       # Read by ProjectBootstrap.StereoBuilder; empty values are ignored by it.
       - name: Export Xcode project with Unity
