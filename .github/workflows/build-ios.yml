@@ -1,0 +1,206 @@
+name: Build iOS (.ipa)
+
+# Builds the Unity project for iOS on a macOS runner and publishes the .ipa to
+# the Releases tab. Pipeline: Unity exports the Xcode project (the project's own
+# ProjectBootstrap.StereoBuilder.BuildIos, same as Tools/ios_build_and_run.sh),
+# Xcode compiles it, and the .app is packaged as an .ipa.
+#
+# By default the .ipa is UNSIGNED: it won't install straight from Safari, but it
+# can be sideloaded with AltStore, Sideloadly or TrollStore, or re-signed in
+# Xcode. Add the Apple secrets below to get a signed, directly-installable .ipa
+# instead (a paid Apple Developer account is needed for a distribution profile).
+#
+# Required secrets (a free Unity Personal license works):
+#   UNITY_LICENSE   full content of your Unity_lic.ulf file
+#                   (how to get it: https://game.ci/docs/github/activation)
+#   UNITY_EMAIL     your Unity account email
+#   UNITY_PASSWORD  your Unity account password
+# Optional secrets (produce a signed .ipa instead of an unsigned one):
+#   APPLE_CERTIFICATE           base64 of a .p12 developer certificate
+#   APPLE_CERTIFICATE_PASSWORD  the .p12's password
+#   APPLE_PROVISIONING_PROFILE  base64 of a .mobileprovision matching the
+#                               bundle id (set it in the bundle_id input)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: App version, major.minor.patch (also names the release)
+        default: '0.1.0'
+        required: false
+      bundle_id:
+        description: Override the app bundle id (empty = com.brenpoly.cardboardxr; must match the provisioning profile when signing)
+        default: ''
+        required: false
+      draft:
+        description: Create the release as a draft for review
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    name: Build iOS .ipa
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      DRAFT: ${{ inputs.draft }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check Unity license secrets
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+        run: |
+          if [ -z "$UNITY_LICENSE" ] && [ -z "$UNITY_EMAIL" ]; then
+            echo "::error::No Unity license configured, and Unity refuses to build without one (a free Personal license works). Add the repository secrets UNITY_LICENSE (full content of your Unity_lic.ulf file), UNITY_EMAIL and UNITY_PASSWORD, then re-run this workflow. See https://game.ci/docs/github/activation for how to get the .ulf file."
+            exit 1
+          fi
+
+      - name: Cache Unity Library
+        uses: actions/cache@v4
+        with:
+          path: Library
+          key: Library-iOS-${{ hashFiles('Packages/manifest.json', 'Packages/packages-lock.json') }}
+          restore-keys: Library-iOS-
+
+      - name: Export Xcode project with Unity
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          # Read by ProjectBootstrap.StereoBuilder; sets the app version (and
+          # releases name the tag from it). Empty values are ignored by the builder.
+          CARDBOARDXR_VERSION: ${{ inputs.version }}
+          CARDBOARDXR_BUNDLE_ID: ${{ inputs.bundle_id }}
+        with:
+          targetPlatform: iOS
+          unityVersion: auto
+          buildsPath: Builds
+          buildMethod: ProjectBootstrap.StereoBuilder.BuildIos
+          cacheUnityInstallationOnMac: true
+
+      # Signed path: archive and export with the certificate and profile from
+      # the secrets. The profile decides the signing identity and export method:
+      # a development profile (get-task-allow true) signs with Apple Development
+      # and exports as development; otherwise Apple Distribution and ad-hoc.
+      - name: Build, sign and export .ipa
+        if: ${{ env.APPLE_CERTIFICATE != '' }}
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          PP_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASS="$(openssl rand -hex 24)"
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode --output="$CERT_PATH"
+          echo -n "$APPLE_PROVISIONING_PROFILE" | base64 --decode --output="$PP_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          PROFILE=$(security cms -D -i "$PP_PATH")
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<< "$PROFILE")
+          PP_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin <<< "$PROFILE")
+          TEAM=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' /dev/stdin <<< "$PROFILE")
+          if /usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' /dev/stdin <<< "$PROFILE" | grep -qi true; then
+            IDENTITY="Apple Development"; METHOD=development
+          else
+            IDENTITY="Apple Distribution"; METHOD=ad-hoc
+          fi
+          echo "METHOD=$METHOD" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PP_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          echo "Signing with team $TEAM, profile $PP_NAME, identity $IDENTITY"
+
+          xcodebuild -project Builds/iOS/Unity-iPhone.xcodeproj -scheme Unity-iPhone \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath Builds/CardboardXR.xcarchive archive -quiet \
+            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$TEAM" \
+            PROVISIONING_PROFILE_SPECIFIER="$PP_NAME" CODE_SIGN_IDENTITY="$IDENTITY"
+
+          APP_BUNDLE=$(xcodebuild -project Builds/iOS/Unity-iPhone.xcodeproj -showBuildSettings 2>/dev/null \
+            | awk '/PRODUCT_BUNDLE_IDENTIFIER/ {print $3; exit}')
+          cat > "$RUNNER_TEMP/exportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>$METHOD</string>
+            <key>teamID</key><string>$TEAM</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$APP_BUNDLE</key><string>$PP_NAME</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive -archivePath Builds/CardboardXR.xcarchive \
+            -exportPath Builds/export -exportOptionsPlist "$RUNNER_TEMP/exportOptions.plist" -quiet
+          IPA=$(find Builds/export -name '*.ipa' -print -quit)
+          cp "$IPA" "CardboardXR-$VERSION-signed.ipa"
+
+      # Unsigned path: no secrets, no Apple account. The .app is simply zipped
+      # into an .ipa, which sideload tools re-sign on install.
+      - name: Build and package unsigned .ipa
+        if: ${{ env.APPLE_CERTIFICATE == '' }}
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild -project Builds/iOS/Unity-iPhone.xcodeproj -scheme Unity-iPhone \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath Builds/xcode-derived -quiet \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          APP=$(find Builds/xcode-derived/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)
+          if [ -z "$APP" ]; then
+            echo "::error::No .app produced by xcodebuild"; exit 1
+          fi
+          echo "Packaging $APP"
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload "CardboardXR-$VERSION-unsigned.ipa"
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CardboardXR-iOS-${{ env.VERSION }}
+          path: CardboardXR-*.ipa
+          if-no-files-found: error
+
+      - name: Publish release with the .ipa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          IPA=$(ls CardboardXR-*.ipa)
+          {
+            echo "CardboardXR for iPhone, built by GitHub Actions from commit $GITHUB_SHA."
+            echo
+            if [ -n "$APPLE_CERTIFICATE" ]; then
+              echo "**Signed build** ($METHOD). Install it by opening the .ipa in Finder or with Apple Configurator on a device covered by the provisioning profile."
+            else
+              echo "**Unsigned build**: iOS won't install it directly. Sideload it with [AltStore](https://altstore.io) or [Sideloadly](https://sideloadly.io) (they re-sign it with your Apple ID), or unzip it and re-sign in Xcode."
+            fi
+            echo
+            echo "Built by GitHub Actions from commit [$GITHUB_SHA](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) with the project's own iOS pipeline (ProjectBootstrap.StereoBuilder.BuildIos, the headless path of Tools/ios_build_and_run.sh)."
+          } > "$RUNNER_TEMP/notes.md"
+          FLAGS=()
+          if [ "$DRAFT" = "true" ]; then FLAGS+=(--draft); fi
+          gh release create "ios-v$VERSION" --target "$GITHUB_SHA" \
+            --title "CardboardXR iOS v$VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+            "${FLAGS[@]}" "$IPA" \
+            || gh release upload "ios-v$VERSION" "$IPA" --clobber
