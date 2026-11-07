@@ -71,22 +71,64 @@ jobs:
           key: Library-iOS-${{ hashFiles('Packages/manifest.json', 'Packages/packages-lock.json') }}
           restore-keys: Library-iOS-
 
-      - name: Export Xcode project with Unity
-        uses: game-ci/unity-builder@v4
+      # game-ci/unity-builder's macOS activation path has no Personal .ulf branch
+      # (only Pro serial or a licensing server), so the Unity install, license
+      # import and export run directly here instead — the same calls the
+      # project's own Tools/ios_build_and_run.sh makes.
+      - name: Cache Unity editor
+        uses: actions/cache@v4
+        with:
+          path: /Applications/Unity/Hub/Editor/6000.6.8f1
+          key: unity-editor-macos-6000.6.8f1-ios-arm64
+
+      - name: Install Unity Hub and editor
+        env:
+          UNITY_CHANGESET: 237b6593792b # from ProjectSettings/ProjectVersion.txt
+        run: |
+          set -euo pipefail
+          UNITY_VERSION=6000.6.8f1
+          UNITY="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+          brew list --cask unity-hub >/dev/null 2>&1 || brew install --cask unity-hub
+          HUB="/Applications/Unity Hub.app/Contents/MacOS/Unity Hub"
+          if [ ! -x "$UNITY" ]; then
+            "$HUB" -- --headless install --version "$UNITY_VERSION" --changeset "$UNITY_CHANGESET" --module ios --architecture arm64 --childModules
+          fi
+          "$UNITY" -version
+
+      # Unity's manual activation: import the .ulf through the editor, and keep
+      # a copy at the classic license path as a fallback (Unity 6000.x reads it
+      # from /Library/Application Support/Unity on macOS).
+      - name: Activate Unity license
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-          # Read by ProjectBootstrap.StereoBuilder; sets the app version (and
-          # releases name the tag from it). Empty values are ignored by the builder.
+        run: |
+          set -euo pipefail
+          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          LICENSE_DIR="/Library/Application Support/Unity"
+          ULF="$RUNNER_TEMP/Unity_lic.ulf"
+          printf '%s' "$UNITY_LICENSE" > "$ULF"
+          sudo mkdir -p "$LICENSE_DIR"
+          sudo chmod -R 777 "$LICENSE_DIR"
+          "$UNITY" -batchmode -nographics -quit -logFile - -manualLicenseFile "$ULF" || \
+            echo "::warning::-manualLicenseFile returned nonzero; relying on the license file placed below"
+          sudo cp "$ULF" "$LICENSE_DIR/Unity_lic.ulf"
+          ls -la "$LICENSE_DIR"
+
+      # Read by ProjectBootstrap.StereoBuilder; empty values are ignored by it.
+      - name: Export Xcode project with Unity
+        env:
           CARDBOARDXR_VERSION: ${{ inputs.version }}
           CARDBOARDXR_BUNDLE_ID: ${{ inputs.bundle_id }}
-        with:
-          targetPlatform: iOS
-          unityVersion: auto
-          buildsPath: Builds
-          buildMethod: ProjectBootstrap.StereoBuilder.BuildIos
-          cacheUnityInstallationOnMac: true
+        run: |
+          set -euo pipefail
+          UNITY="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          "$UNITY" -batchmode -nographics -quit \
+            -projectPath "$GITHUB_WORKSPACE" \
+            -buildTarget iOS \
+            -executeMethod ProjectBootstrap.StereoBuilder.BuildIos \
+            -logFile - | tee unity-export.log
+          grep -q "Build Succeeded" unity-export.log || {
+            echo "::error::Unity export did not report Build Succeeded"; exit 1; }
 
       # Signed path: archive and export with the certificate and profile from
       # the secrets. The profile decides the signing identity and export method:
