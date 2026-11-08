@@ -248,9 +248,11 @@ jobs:
             echo
             echo "Built by GitHub Actions from commit [$GITHUB_SHA](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) with the project's own iOS pipeline (ProjectBootstrap.StereoBuilder.BuildIos, the headless path of Tools/ios_build_and_run.sh)."
           } > "$RUNNER_TEMP/notes.md"
-          FLAGS=()
-          if [ "$DRAFT" = "true" ]; then FLAGS+=(--draft); fi
+          # A scalar instead of an array: macOS's bash 3.2 treats an empty
+          # array as unbound under set -u.
+          DRAFT_FLAG=""
+          if [ "$DRAFT" = "true" ]; then DRAFT_FLAG="--draft"; fi
           gh release create "ios-v$VERSION" --target "$GITHUB_SHA" \
             --title "CardboardXR iOS v$VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
-            "${FLAGS[@]}" "$IPA" \
+            $DRAFT_FLAG "$IPA" \
             || gh release upload "ios-v$VERSION" "$IPA" --clobber
